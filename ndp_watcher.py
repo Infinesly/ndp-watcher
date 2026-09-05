@@ -1,17 +1,56 @@
 #!/usr/bin/env python3
+import csv
+from datetime import datetime
 from scapy.all import sniff, Ether, IPv6
 from scapy.layers.inet6 import (
     ICMPv6ND_RS, ICMPv6ND_RA, ICMPv6ND_NS, ICMPv6ND_NA,
     ICMPv6NDOptPrefixInfo
 )
+from rich.live import Live
+from rich.table import Table
+from collections import deque
 
-# The "notebook" — two dictionaries acting as our baseline memory
-known_routers = {}      # maps router MAC -> {lifetime, prefix}
-known_neighbors = {}    # maps IPv6 address -> MAC that owns it
+known_routers = {}
+known_neighbors = {}
 
-def handle_packet(pkt):
+LOG_FILE = "ndp_watcher_log.csv"
+MAX_ROWS = 15  # how many recent events to show on screen at once
+
+# A deque is like a list, but with a max size — old items automatically
+# fall off the end when new ones are added past the limit
+recent_events = deque(maxlen=MAX_ROWS)
+
+def init_log():
+    try:
+        with open(LOG_FILE, "x", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp", "event_type", "source_mac", "details"])
+    except FileExistsError:
+        pass
+
+def log_event(event_type, source_mac, details):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([timestamp, event_type, source_mac, details])
+    recent_events.append((timestamp, event_type, source_mac, details))
+
+def build_table():
+    table = Table(title="NDP Watcher — Live Feed")
+    table.add_column("Time", style="cyan")
+    table.add_column("Event", style="bold")
+    table.add_column("MAC")
+    table.add_column("Details")
+
+    for timestamp, event_type, source_mac, details in recent_events:
+        # Color alerts red so they visually stand out from normal events
+        style = "red bold" if "ALERT" in event_type else "white"
+        table.add_row(timestamp, event_type, source_mac, details, style=style)
+
+    return table
+
+def handle_packet(pkt, live):
     src_mac = pkt[Ether].src if pkt.haslayer(Ether) else "unknown"
-    src_ip = pkt[IPv6].src if pkt.haslayer(IPv6) else "unknown"
 
     if pkt.haslayer(ICMPv6ND_RA):
         ra = pkt[ICMPv6ND_RA]
@@ -20,16 +59,14 @@ def handle_packet(pkt):
             prefix = pkt[ICMPv6NDOptPrefixInfo].prefix
 
         if src_mac not in known_routers:
-            # First time ever seeing this router — just remember it
             known_routers[src_mac] = {"lifetime": ra.routerlifetime, "prefix": prefix}
-            print(f"[RA] New router learned: {src_mac} lifetime={ra.routerlifetime}s prefix={prefix}")
+            log_event("RA_NEW", src_mac, f"lifetime={ra.routerlifetime}s prefix={prefix}")
         else:
-            # We've seen this router before — check if anything changed
             old = known_routers[src_mac]
             if old["prefix"] != prefix:
-                print(f"[!] ALERT: Router {src_mac} changed prefix from {old['prefix']} to {prefix}")
+                log_event("ALERT_PREFIX_CHANGE", src_mac, f"old={old['prefix']} new={prefix}")
             if ra.routerlifetime == 0:
-                print(f"[!] ALERT: Router {src_mac} sent lifetime=0 (possible DoS attempt)")
+                log_event("ALERT_ZERO_LIFETIME", src_mac, "possible DoS attempt")
             known_routers[src_mac] = {"lifetime": ra.routerlifetime, "prefix": prefix}
 
     elif pkt.haslayer(ICMPv6ND_NA):
@@ -37,21 +74,17 @@ def handle_packet(pkt):
         target_ip = na.tgt
 
         if target_ip not in known_neighbors:
-            # First time seeing this IP claimed — just remember it
             known_neighbors[target_ip] = src_mac
-            print(f"[NA] New mapping learned: {target_ip} -> {src_mac}")
+            log_event("NA_NEW", src_mac, f"claims {target_ip}")
         else:
-            # We've seen this IP claimed before — does the MAC match?
             old_mac = known_neighbors[target_ip]
             if old_mac != src_mac:
-                print(f"[!] ALERT: Possible NDP spoofing! {target_ip} was {old_mac}, now claimed by {src_mac}")
-            # else: same device re-confirming, nothing to flag
+                log_event("ALERT_SPOOFING", src_mac, f"{target_ip} was {old_mac}")
 
-    elif pkt.haslayer(ICMPv6ND_RS):
-        print(f"[RS] from {src_mac} — requesting router info")
+    live.update(build_table())
 
-    elif pkt.haslayer(ICMPv6ND_NS):
-        ns = pkt[ICMPv6ND_NS]
-        print(f"[NS] from {src_mac} — asking who has {ns.tgt}")
+init_log()
 
-sniff(iface="eth0", filter="icmp6", prn=handle_packet, store=False)
+with Live(build_table(), refresh_per_second=4) as live:
+    sniff(iface="eth0", filter="icmp6",
+          prn=lambda pkt: handle_packet(pkt, live), store=False)
