@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta
 from scapy.all import sniff, Ether, IPv6
 from scapy.layers.inet6 import (
     ICMPv6ND_RS, ICMPv6ND_RA, ICMPv6ND_NS, ICMPv6ND_NA,
@@ -11,13 +11,12 @@ from rich.table import Table
 from collections import deque
 
 known_routers = {}
-known_neighbors = {}
+known_neighbors = {}  # { ip: {"mac": ..., "last_seen": datetime} }
 
 LOG_FILE = "ndp_watcher_log.csv"
-MAX_ROWS = 15  # how many recent events to show on screen at once
+MAX_ROWS = 15
+SPOOF_WINDOW = timedelta(seconds=30)
 
-# A deque is like a list, but with a max size — old items automatically
-# fall off the end when new ones are added past the limit
 recent_events = deque(maxlen=MAX_ROWS)
 
 def init_log():
@@ -43,7 +42,6 @@ def build_table():
     table.add_column("Details")
 
     for timestamp, event_type, source_mac, details in recent_events:
-        # Color alerts red so they visually stand out from normal events
         style = "red bold" if "ALERT" in event_type else "white"
         table.add_row(timestamp, event_type, source_mac, details, style=style)
 
@@ -72,14 +70,29 @@ def handle_packet(pkt, live):
     elif pkt.haslayer(ICMPv6ND_NA):
         na = pkt[ICMPv6ND_NA]
         target_ip = na.tgt
+        now = datetime.now()
 
         if target_ip not in known_neighbors:
-            known_neighbors[target_ip] = src_mac
+            known_neighbors[target_ip] = {"mac": src_mac, "last_seen": now}
             log_event("NA_NEW", src_mac, f"claims {target_ip}")
         else:
-            old_mac = known_neighbors[target_ip]
-            if old_mac != src_mac:
-                log_event("ALERT_SPOOFING", src_mac, f"{target_ip} was {old_mac}")
+            record = known_neighbors[target_ip]
+            if record["mac"] != src_mac:
+                time_since_last_seen = now - record["last_seen"]
+                if time_since_last_seen < SPOOF_WINDOW:
+                    log_event("ALERT_SPOOFING", src_mac,
+                              f"{target_ip} was {record['mac']} ({time_since_last_seen.seconds}s ago), now claimed by {src_mac}")
+                else:
+                    log_event("INFO_MAC_CHANGE", src_mac,
+                              f"{target_ip} previously {record['mac']}, now {src_mac} (after {time_since_last_seen})")
+            known_neighbors[target_ip] = {"mac": src_mac, "last_seen": now}
+
+    elif pkt.haslayer(ICMPv6ND_RS):
+        log_event("RS", src_mac, "requesting router info")
+
+    elif pkt.haslayer(ICMPv6ND_NS):
+        ns = pkt[ICMPv6ND_NS]
+        log_event("NS", src_mac, f"asking who has {ns.tgt}")
 
     live.update(build_table())
 
