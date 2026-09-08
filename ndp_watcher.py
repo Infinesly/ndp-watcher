@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import csv
+import json
+import os
 from datetime import datetime, timedelta
 from scapy.all import sniff, Ether, IPv6
 from scapy.layers.inet6 import (
@@ -11,9 +13,10 @@ from rich.table import Table
 from collections import deque
 
 known_routers = {}
-known_neighbors = {}  # { ip: {"mac": ..., "last_seen": datetime} }
+known_neighbors = {}
 
 LOG_FILE = "ndp_watcher_log.csv"
+BASELINE_FILE = "ndp_baseline.json"
 MAX_ROWS = 15
 SPOOF_WINDOW = timedelta(seconds=30)
 
@@ -26,6 +29,44 @@ def init_log():
             writer.writerow(["timestamp", "event_type", "source_mac", "details"])
     except FileExistsError:
         pass
+
+def load_baseline():
+    global known_routers, known_neighbors
+    if not os.path.exists(BASELINE_FILE):
+        return  # no saved baseline yet, start fresh
+
+    with open(BASELINE_FILE, "r") as f:
+        data = json.load(f)
+
+    known_routers = data.get("routers", {})
+
+    # known_neighbors stores "last_seen" as a datetime object during runtime,
+    # but JSON can only store plain text — so we convert it back from a string
+    loaded_neighbors = data.get("neighbors", {})
+    for ip, record in loaded_neighbors.items():
+        record["last_seen"] = datetime.fromisoformat(record["last_seen"])
+    known_neighbors = loaded_neighbors
+
+    print(f"Loaded baseline: {len(known_routers)} routers, {len(known_neighbors)} neighbors")
+
+def save_baseline():
+    # Build a JSON-safe copy of known_neighbors, converting datetime -> string
+    neighbors_to_save = {}
+    for ip, record in known_neighbors.items():
+        neighbors_to_save[ip] = {
+            "mac": record["mac"],
+            "last_seen": record["last_seen"].isoformat()
+        }
+
+    data = {
+        "routers": known_routers,
+        "neighbors": neighbors_to_save
+    }
+
+    with open(BASELINE_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+    print(f"Saved baseline: {len(known_routers)} routers, {len(known_neighbors)} neighbors")
 
 def log_event(event_type, source_mac, details):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -97,7 +138,13 @@ def handle_packet(pkt, live):
     live.update(build_table())
 
 init_log()
+load_baseline()
 
-with Live(build_table(), refresh_per_second=4) as live:
-    sniff(iface="eth0", filter="icmp6",
-          prn=lambda pkt: handle_packet(pkt, live), store=False)
+try:
+    with Live(build_table(), refresh_per_second=4) as live:
+        sniff(iface="eth0", filter="icmp6",
+              prn=lambda pkt: handle_packet(pkt, live), store=False)
+except KeyboardInterrupt:
+    pass
+finally:
+    save_baseline()
