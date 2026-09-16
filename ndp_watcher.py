@@ -12,13 +12,37 @@ from rich.live import Live
 from rich.table import Table
 from collections import deque
 
+CONFIG_FILE = "config.json"
+
+def load_config():
+    default_config = {
+        "interface": "eth0",
+        "log_file": "ndp_watcher_log.csv",
+        "baseline_file": "ndp_baseline.json",
+        "max_rows": 15,
+        "spoof_window_seconds": 30
+    }
+
+    if not os.path.exists(CONFIG_FILE):
+        print(f"No {CONFIG_FILE} found — using default settings")
+        return default_config
+
+    with open(CONFIG_FILE, "r") as f:
+        user_config = json.load(f)
+
+    # Merge: start with defaults, overwrite with whatever the user actually specified
+    default_config.update(user_config)
+    return default_config
+
+config = load_config()
+
 known_routers = {}
 known_neighbors = {}
 
-LOG_FILE = "ndp_watcher_log.csv"
-BASELINE_FILE = "ndp_baseline.json"
-MAX_ROWS = 15
-SPOOF_WINDOW = timedelta(seconds=30)
+LOG_FILE = config["log_file"]
+BASELINE_FILE = config["baseline_file"]
+MAX_ROWS = config["max_rows"]
+SPOOF_WINDOW = timedelta(seconds=config["spoof_window_seconds"])
 
 recent_events = deque(maxlen=MAX_ROWS)
 
@@ -33,15 +57,13 @@ def init_log():
 def load_baseline():
     global known_routers, known_neighbors
     if not os.path.exists(BASELINE_FILE):
-        return  # no saved baseline yet, start fresh
+        return
 
     with open(BASELINE_FILE, "r") as f:
         data = json.load(f)
 
     known_routers = data.get("routers", {})
 
-    # known_neighbors stores "last_seen" as a datetime object during runtime,
-    # but JSON can only store plain text — so we convert it back from a string
     loaded_neighbors = data.get("neighbors", {})
     for ip, record in loaded_neighbors.items():
         record["last_seen"] = datetime.fromisoformat(record["last_seen"])
@@ -50,7 +72,6 @@ def load_baseline():
     print(f"Loaded baseline: {len(known_routers)} routers, {len(known_neighbors)} neighbors")
 
 def save_baseline():
-    # Build a JSON-safe copy of known_neighbors, converting datetime -> string
     neighbors_to_save = {}
     for ip, record in known_neighbors.items():
         neighbors_to_save[ip] = {
@@ -142,7 +163,7 @@ load_baseline()
 
 try:
     with Live(build_table(), refresh_per_second=4) as live:
-        sniff(iface="eth0", filter="icmp6",
+        sniff(iface=config["interface"], filter="icmp6",
               prn=lambda pkt: handle_packet(pkt, live), store=False)
 except KeyboardInterrupt:
     pass

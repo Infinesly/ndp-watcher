@@ -1,0 +1,8 @@
+{
+  "interface": "eth0",
+  "log_file": "ndp_watcher_log.csv",
+  "baseline_file": "ndp_baseline.json",
+  "max_rows": 15,
+  "spoof_window_seconds": 30
+}
+
